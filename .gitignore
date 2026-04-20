@@ -1,0 +1,36 @@
+# --- Source data / outputs (large, private) ---
+*.MP4
+*.mp4
+*.MOV
+*.mov
+*.SRT              # DJI subtitle files contain precise GPS coordinates
+*.srt
+frames/
+dist/
+build/
+*.zip
+
+# --- PyInstaller build artifacts ---
+windows_build/bin/
+windows_build/dist/
+windows_build/build/
+*.spec.bak
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- macOS metadata ---
+.DS_Store
+._*
+
+# --- IDEs / editors ---
+.idea/
+.vscode/
+*.swp
+
+# --- Assistant workspace ---
+.claude/
