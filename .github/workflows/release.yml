@@ -136,7 +136,7 @@ jobs:
 
       # ----- Rename + upload -----
 
-      - name: Stage asset (Windows: zip the onedir folder)
+      - name: "Stage asset (Windows -- zip the onedir folder)"
         if: matrix.runner == 'windows-latest'
         shell: pwsh
         run: |
@@ -151,7 +151,7 @@ jobs:
           Compress-Archive -Path $src -DestinationPath $dst -Force
           Get-Item $dst | Format-List Name, Length
 
-      - name: Stage asset (Mac/Linux: rename single binary)
+      - name: "Stage asset (Mac/Linux -- rename single binary)"
         if: matrix.runner != 'windows-latest'
         shell: bash
         run: |
