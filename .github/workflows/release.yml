@@ -21,8 +21,8 @@ jobs:
         include:
           - runner: windows-latest
             os_label: windows-x64
-            asset_name: extract-frames-windows-x64.exe
-            ext: .exe
+            asset_name: extract-frames-windows-x64.zip
+            ext: ""
           - runner: macos-14            # Apple Silicon
             os_label: macos-arm64
             asset_name: extract-frames-macos-arm64
@@ -136,7 +136,23 @@ jobs:
 
       # ----- Rename + upload -----
 
-      - name: Stage asset
+      - name: Stage asset (Windows: zip the onedir folder)
+        if: matrix.runner == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = "cross_build\dist\extract-frames"
+          $dst = "cross_build\dist\${{ matrix.asset_name }}"
+          if (-not (Test-Path $src)) {
+              throw "Expected onedir folder $src not found"
+          }
+          # Zip with the folder as the top-level entry so users get a
+          # single 'extract-frames\' dir on extract.
+          Compress-Archive -Path $src -DestinationPath $dst -Force
+          Get-Item $dst | Format-List Name, Length
+
+      - name: Stage asset (Mac/Linux: rename single binary)
+        if: matrix.runner != 'windows-latest'
         shell: bash
         run: |
           set -euxo pipefail

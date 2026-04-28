@@ -14,6 +14,18 @@ install required for end users.
 
 ## Versions
 
+### v0.3.1 — Windows SmartScreen mitigations
+
+* Windows build switched from PyInstaller `--onefile` to `--onedir`,
+  shipped as a zip. Defender / SmartScreen flag the self-extracting
+  `--onefile` pattern much more aggressively than a plain folder of DLLs;
+  switching dramatically reduces the rate at which the exe is blocked.
+* Embedded a Windows `VSVersionInfo` resource so the SmartScreen dialog
+  shows the real product name and publisher (`NJULiuYvXi /
+  DJI Frame Extractor`) instead of "Unknown publisher".
+* README documents the bypass for Windows SmartScreen and macOS
+  Gatekeeper for the (still unsigned) downloads.
+
 ### v0.3.0 — Adaptive (similarity-based) extraction
 
 Script: [`extract_frames_with_gps_similarity.py`](extract_frames_with_gps_similarity.py)
@@ -75,12 +87,44 @@ Script: [`extract_frames_with_gps.py`](extract_frames_with_gps.py)
 
 Download from the latest [Release](../../releases/latest):
 
-* **Windows** — `extract_frames_hwaccel-windows.exe` (one-file, ffmpeg /
-  ffprobe / exiftool bundled inside).
-* **macOS (Apple Silicon)** — `extract-frames-macos-arm64` (requires
-  `brew install ffmpeg exiftool` on the host).
-* **Linux (x86_64)** — `extract-frames-linux-x86_64` (requires
-  `apt install ffmpeg libimage-exiftool-perl`).
+* **Windows (x64)** — `extract-frames-windows-x64.zip`. Extract anywhere,
+  then run `extract-frames.exe` inside. ffmpeg / ffprobe / exiftool are
+  bundled.
+* **macOS (Apple Silicon)** — `extract-frames-macos-arm64`. Run with
+  `chmod +x extract-frames-macos-arm64 && ./extract-frames-macos-arm64`.
+  Requires `brew install ffmpeg exiftool` on the host.
+* **Linux (x86_64)** — `extract-frames-linux-x86_64`. Run with
+  `chmod +x extract-frames-linux-x86_64 && ./extract-frames-linux-x86_64`.
+  Requires `apt install ffmpeg libimage-exiftool-perl`.
+
+#### Windows SmartScreen warning ("Windows protected your PC")
+
+The `.exe` is **not code-signed** (signing certificates cost money).
+Microsoft Defender SmartScreen will show a blue warning the first time
+you run it. To bypass:
+
+1. Click **More info** in the warning dialog.
+2. Click **Run anyway**.
+
+This decision is remembered — subsequent runs are silent. The exe is
+built reproducibly from this repo by [GitHub Actions](.github/workflows/release.yml);
+you can also build it yourself from source (see below) and skip the
+download entirely.
+
+If your IT policy blocks SmartScreen overrides:
+- Right-click the zip / exe → Properties → tick **Unblock** before running.
+- Or run from source (`pip install` flow below).
+- Or build the exe locally with `windows_build/build.bat`.
+
+#### macOS Gatekeeper warning ("cannot be opened because the developer cannot be verified")
+
+Same situation — unsigned binary. To bypass:
+
+```bash
+xattr -d com.apple.quarantine extract-frames-macos-arm64
+chmod +x extract-frames-macos-arm64
+./extract-frames-macos-arm64
+```
 
 ### Run from source
 
