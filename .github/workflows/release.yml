@@ -1,0 +1,182 @@
+name: Release builds
+
+# Build Win/Mac/Linux executables when a tag like v1.2.3 is pushed,
+# and attach them to the matching GitHub Release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # needed to upload release assets
+
+jobs:
+  build:
+    name: Build ${{ matrix.os_label }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            os_label: windows-x64
+            asset_name: extract-frames-windows-x64.exe
+            ext: .exe
+          - runner: macos-14            # Apple Silicon
+            os_label: macos-arm64
+            asset_name: extract-frames-macos-arm64
+            ext: ""
+          - runner: ubuntu-22.04
+            os_label: linux-x86_64
+            asset_name: extract-frames-linux-x86_64
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller opencv-python numpy
+
+      # ----- Fetch ffmpeg / ffprobe / exiftool into cross_build/bin/ -----
+
+      - name: Fetch deps (Windows)
+        if: matrix.runner == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol =
+              [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+          $bin = "cross_build\bin"
+          New-Item -ItemType Directory -Force -Path $bin | Out-Null
+
+          # ffmpeg + ffprobe (gyan.dev release-essentials build)
+          $ffZip = "$env:TEMP\ffmpeg.zip"
+          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" `
+                            -OutFile $ffZip -UseBasicParsing
+          Expand-Archive -Force $ffZip "$env:TEMP\ffmpeg-x"
+          $ffmpegExe  = Get-ChildItem "$env:TEMP\ffmpeg-x" -Recurse -Filter ffmpeg.exe  | Select-Object -First 1
+          $ffprobeExe = Get-ChildItem "$env:TEMP\ffmpeg-x" -Recurse -Filter ffprobe.exe | Select-Object -First 1
+          Copy-Item -Force $ffmpegExe.FullName  "$bin\ffmpeg.exe"
+          Copy-Item -Force $ffprobeExe.FullName "$bin\ffprobe.exe"
+
+          # exiftool (latest from exiftool.org)
+          $etVer = (Invoke-WebRequest "https://exiftool.org/ver.txt" -UseBasicParsing).Content.Trim()
+          $etZip = "$env:TEMP\exiftool.zip"
+          Invoke-WebRequest "https://exiftool.org/exiftool-${etVer}_64.zip" -OutFile $etZip -UseBasicParsing
+          Expand-Archive -Force $etZip "$env:TEMP\exiftool-x"
+          $etExe = Get-ChildItem "$env:TEMP\exiftool-x" -Recurse -Filter "exiftool*.exe" | Select-Object -First 1
+          Copy-Item -Force $etExe.FullName "$bin\exiftool.exe"
+          $etFiles = Get-ChildItem "$env:TEMP\exiftool-x" -Recurse -Directory -Filter "exiftool_files" | Select-Object -First 1
+          if ($etFiles) { Copy-Item -Recurse -Force $etFiles.FullName "$bin\exiftool_files" }
+
+          Get-ChildItem $bin
+
+      - name: Fetch deps (macOS)
+        if: matrix.runner == 'macos-14'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p cross_build/bin
+
+          # Use Homebrew's ffmpeg/exiftool, then copy resolved binaries into bin/.
+          # On the GitHub-hosted macos-14 runner Homebrew is preinstalled.
+          brew install ffmpeg exiftool
+
+          cp -L "$(command -v ffmpeg)"   cross_build/bin/ffmpeg
+          cp -L "$(command -v ffprobe)"  cross_build/bin/ffprobe
+          cp -L "$(command -v exiftool)" cross_build/bin/exiftool
+          chmod +x cross_build/bin/*
+          ls -l cross_build/bin/
+
+      - name: Fetch deps (Linux)
+        if: matrix.runner == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p cross_build/bin
+
+          # Use a static ffmpeg build (johnvansickle.com) so the binary
+          # works on any glibc without depending on apt's libavcodec.
+          curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+              -o /tmp/ffmpeg.tar.xz
+          mkdir -p /tmp/ffx && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffx --strip-components=1
+          cp /tmp/ffx/ffmpeg  cross_build/bin/ffmpeg
+          cp /tmp/ffx/ffprobe cross_build/bin/ffprobe
+
+          # exiftool: install via apt and copy the resolved binary. The script
+          # is a Perl wrapper -> we also need to ship its lib tree, which is
+          # awkward for one-file PyInstaller; simplest path is to require the
+          # user to apt-install libimage-exiftool-perl (documented in README).
+          # We still copy the binary so a system without it can fall back via
+          # PATH.
+          sudo apt-get update -qq
+          sudo apt-get install -y libimage-exiftool-perl
+          cp -L "$(command -v exiftool)" cross_build/bin/exiftool || true
+
+          chmod +x cross_build/bin/* || true
+          ls -l cross_build/bin/
+
+      # ----- Build with PyInstaller -----
+
+      - name: Run PyInstaller
+        shell: bash
+        working-directory: cross_build
+        run: |
+          python -m PyInstaller build.spec --clean --noconfirm
+          ls -l dist/
+
+      # ----- Rename + upload -----
+
+      - name: Stage asset
+        shell: bash
+        run: |
+          set -euxo pipefail
+          src="cross_build/dist/extract-frames${{ matrix.ext }}"
+          dst="cross_build/dist/${{ matrix.asset_name }}"
+          mv "$src" "$dst"
+          ls -lh "$dst"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: cross_build/dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p release-files
+          # download-artifact creates one folder per artifact name; flatten.
+          find artifacts -type f -exec cp -v {} release-files/ \;
+          ls -l release-files/
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release-files/*

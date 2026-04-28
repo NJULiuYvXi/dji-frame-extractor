@@ -6,6 +6,7 @@
 *.SRT              # DJI subtitle files contain precise GPS coordinates
 *.srt
 frames/
+frames-*/
 dist/
 build/
 *.zip
@@ -14,6 +15,9 @@ build/
 windows_build/bin/
 windows_build/dist/
 windows_build/build/
+cross_build/bin/
+cross_build/dist/
+cross_build/build/
 *.spec.bak
 
 # --- Python ---
