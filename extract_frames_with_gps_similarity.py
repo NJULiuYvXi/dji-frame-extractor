@@ -752,74 +752,87 @@ def _write_gps_exif(output_dir: Path, start_number: int, written: int,
     if written <= 0:
         return
 
+    # Build the list of output JPEGs that actually exist.
+    jpg_files: list[Path] = []
+    for i in range(written):
+        p = output_dir / f"{start_number + i}.jpg"
+        if p.exists():
+            jpg_files.append(p)
+    if not jpg_files:
+        log("  No JPEG files found in output dir; skipping EXIF.")
+        return
+
     # ------------------------------------------------------------------
     # Step 1: write default camera metadata (DJI Mavic 3 / FC3411) to
-    # all frames so photogrammetry software recognises the camera.
+    # every frame so photogrammetry software recognises the camera.
     # ------------------------------------------------------------------
-    log("  Writing default camera EXIF (DJI FC3411) to all frames...")
+    log(f"  Writing default camera EXIF (DJI FC3411) to {len(jpg_files)} frames...")
     cam_cmd = (
-        ["exiftool", "-overwrite_original", "-q", "-q"]
+        ["exiftool", "-overwrite_original"]
         + DEFAULT_CAMERA_EXIF
-        + [str(output_dir)]
+        + [str(p) for p in jpg_files]
     )
     r_cam = subprocess.run(cam_cmd, capture_output=True, text=True)
-    if r_cam.returncode != 0 and r_cam.stderr.strip():
-        log(f"  exiftool (camera EXIF) stderr: {r_cam.stderr.strip()}")
+    if r_cam.returncode != 0:
+        log(f"  exiftool (camera EXIF) rc={r_cam.returncode}")
+        if r_cam.stderr.strip():
+            log(f"  stderr: {r_cam.stderr.strip()}")
+        if r_cam.stdout.strip():
+            log(f"  stdout: {r_cam.stdout.strip()}")
     else:
         log("  Camera EXIF done.")
 
     # ------------------------------------------------------------------
-    # Step 2: write per-frame GPS + focal length via CSV batch.
+    # Step 2: write per-frame GPS + focal length via exiftool arg-file
+    # to avoid CSV path-encoding issues on Windows.
     # ------------------------------------------------------------------
-    csv_path = output_dir / f".exif_batch_{stem}.csv"
+    argfile = output_dir / f".exif_args_{stem}.txt"
     rows = 0
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "SourceFile",
-            "GPSLatitude", "GPSLatitudeRef",
-            "GPSLongitude", "GPSLongitudeRef",
-            "GPSAltitude", "GPSAltitudeRef",
-            "FocalLength", "FocalLengthIn35mmFormat",
-        ])
+    with argfile.open("w", encoding="utf-8") as f:
         for i in range(written):
             if i >= len(src_indices):
                 break
             src_idx = src_indices[i]
             gps = gps_map.get(src_idx)
-            lat, lon, alt = gps if gps else (None, None, None)
             jpg = output_dir / f"{start_number + i}.jpg"
+            if not jpg.exists():
+                continue
+
+            f.write(f"-FocalLength={focal_length}\n")
+            f.write(f"-FocalLengthIn35mmFormat={int(focal_length)}\n")
             if gps is not None:
-                w.writerow([
-                    str(jpg.resolve()),
-                    abs(lat), "N" if lat >= 0 else "S",
-                    abs(lon), "E" if lon >= 0 else "W",
-                    abs(alt), 0 if alt >= 0 else 1,
-                    focal_length, int(focal_length),
-                ])
-            else:
-                w.writerow([
-                    str(jpg.resolve()),
-                    "", "", "", "", "", "",
-                    focal_length, int(focal_length),
-                ])
+                lat, lon, alt = gps
+                lat_ref = "N" if lat >= 0 else "S"
+                lon_ref = "E" if lon >= 0 else "W"
+                alt_ref = 0 if alt >= 0 else 1
+                f.write(f"-GPSLatitude={abs(lat)}\n")
+                f.write(f"-GPSLatitudeRef={lat_ref}\n")
+                f.write(f"-GPSLongitude={abs(lon)}\n")
+                f.write(f"-GPSLongitudeRef={lon_ref}\n")
+                f.write(f"-GPSAltitude={abs(alt)}\n")
+                f.write(f"-GPSAltitudeRef={alt_ref}\n")
+            f.write(f"{jpg}\n")
+            f.write("-execute\n")
             rows += 1
 
     if rows > 0:
         log(f"  Writing EXIF (GPS + focal {focal_length}mm) to {rows} files via exiftool...")
         r = subprocess.run(
-            ["exiftool", f"-csv={csv_path}", "-overwrite_original",
-             "-q", "-q", str(output_dir)],
+            ["exiftool", "-@", str(argfile), "-overwrite_original"],
             capture_output=True, text=True,
         )
         if r.returncode != 0:
-            log(f"  exiftool stderr: {r.stderr.strip()}")
+            log(f"  exiftool (GPS) rc={r.returncode}")
+            if r.stderr.strip():
+                log(f"  stderr: {r.stderr.strip()}")
+            if r.stdout.strip():
+                log(f"  stdout: {r.stdout.strip()}")
         else:
             log("  EXIF done.")
     else:
         log("  No frames to write EXIF to.")
     try:
-        csv_path.unlink()
+        argfile.unlink()
     except OSError:
         pass
 
