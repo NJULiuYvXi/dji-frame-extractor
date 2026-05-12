@@ -39,11 +39,11 @@ Cross-platform support:
   GPU path applies to ORB feature detection and matching only.
 
 External dependencies:
-  - ffmpeg / ffprobe / exiftool       (must be on PATH)
+  - ffmpeg / ffprobe                  (must be on PATH)
+  - piexif                            (pip install piexif)
   - opencv-python or opencv-contrib-python (and numpy)
 """
 
-import csv
 import os
 import platform
 import queue
@@ -104,45 +104,14 @@ def find_srt(video_path: Path):
     return None
 
 
-# Default camera EXIF metadata extracted from DJI Mavic 3 (FC3411).
-# Written to every output frame so that photogrammetry software (DJI Terra,
-# Metashape, COLMAP, ...) can recognise the camera model and lens.
-# GPS, FocalLength, and image-geometry tags are written per-frame separately.
-DEFAULT_CAMERA_EXIF: list[str] = [
-    "-Make=DJI",
-    "-Model=FC3411",
-    "-Software=10.10.46.06",
-    "-ExifVersion=0230",
-    "-FNumber=2.8",
-    "-ExposureProgram=1",
-    "-ISOSpeedRatings=200",
-    "-ShutterSpeedValue=9.9658",
-    "-ApertureValue=2.97",
-    "-MaxApertureValue=2.97",
-    "-ExposureBiasValue=0.0",
-    "-MeteringMode=1",
-    "-LightSource=1",
-    "-Flash=0",
-    "-ColorSpace=1",
-    "-SceneCaptureType=0",
-    "-Contrast=0",
-    "-Saturation=0",
-    "-Sharpness=0",
-    "-ExposureMode=1",
-    "-WhiteBalance=0",
-    "-DigitalZoomRatio=1.0",
-    "-GainControl=0",
-    "-LensSpecification=22.4 22.4 2.8 2.8",
-    "-FileSource=Digital Camera",
-    "-SceneType=Directly photographed",
-    "-ComponentsConfiguration=1 2 3 0",
-    "-FlashPixVersion=0100",
-    "-YCbCrPositioning=1",
-    "-ResolutionUnit=2",
-    "-XResolution=72",
-    "-YResolution=72",
-    "-Orientation=1",
-]
+# --- piexif import (used for writing EXIF metadata) --------------------------
+
+def _try_import_piexif():
+    try:
+        import piexif  # type: ignore
+        return piexif, None
+    except Exception as e:  # noqa: BLE001
+        return None, e
 
 
 def probe_frame_count(video_path: Path) -> int:
@@ -746,95 +715,117 @@ def extract_video_adaptive(
 
 # --- GPS EXIF (shared by both modes) ----------------------------------------
 
+def _deg_to_dms_rational(deg_float):
+    """Convert decimal degrees to piexif DMS rational tuple."""
+    d = int(abs(deg_float))
+    m_float = (abs(deg_float) - d) * 60
+    m = int(m_float)
+    s = (m_float - m) * 60
+    # Use high denominator for sub-arcsecond precision.
+    return ((d, 1), (m, 1), (int(round(s * 10000)), 10000))
+
+
 def _write_gps_exif(output_dir: Path, start_number: int, written: int,
                     src_indices, gps_map, stem: str, log,
                     focal_length: float = 24.0):
+    """Write camera metadata + per-frame GPS + focal length using piexif.
+
+    Pure Python -- no exiftool dependency, no path-encoding issues on
+    Windows with non-ASCII (e.g. Chinese) directory names.
+    """
     if written <= 0:
         return
 
-    # Build the list of output JPEGs that actually exist.
-    jpg_files: list[Path] = []
-    for i in range(written):
-        p = output_dir / f"{start_number + i}.jpg"
-        if p.exists():
-            jpg_files.append(p)
-    if not jpg_files:
-        log("  No JPEG files found in output dir; skipping EXIF.")
+    piexif, err = _try_import_piexif()
+    if piexif is None:
+        log(f"  ERROR: piexif not installed ({err}). "
+            "Install with:  pip install piexif")
         return
 
-    # ------------------------------------------------------------------
-    # Step 1: write default camera metadata (DJI Mavic 3 / FC3411) to
-    # every frame so photogrammetry software recognises the camera.
-    # ------------------------------------------------------------------
-    log(f"  Writing default camera EXIF (DJI FC3411) to {len(jpg_files)} frames...")
-    cam_cmd = (
-        ["exiftool", "-overwrite_original"]
-        + DEFAULT_CAMERA_EXIF
-        + [str(p) for p in jpg_files]
-    )
-    r_cam = subprocess.run(cam_cmd, capture_output=True, text=True)
-    if r_cam.returncode != 0:
-        log(f"  exiftool (camera EXIF) rc={r_cam.returncode}")
-        if r_cam.stderr.strip():
-            log(f"  stderr: {r_cam.stderr.strip()}")
-        if r_cam.stdout.strip():
-            log(f"  stdout: {r_cam.stdout.strip()}")
-    else:
-        log("  Camera EXIF done.")
+    # -- Default camera tags (DJI Mavic 3 / FC3411) -----------------------
+    zeroth_ifd = {
+        piexif.ImageIFD.Make: b"DJI",
+        piexif.ImageIFD.Model: b"FC3411",
+        piexif.ImageIFD.Software: b"10.10.46.06",
+        piexif.ImageIFD.Orientation: 1,
+        piexif.ImageIFD.XResolution: (72, 1),
+        piexif.ImageIFD.YResolution: (72, 1),
+        piexif.ImageIFD.ResolutionUnit: 2,
+        piexif.ImageIFD.YCbCrPositioning: 1,
+    }
 
-    # ------------------------------------------------------------------
-    # Step 2: write per-frame GPS + focal length via exiftool arg-file
-    # to avoid CSV path-encoding issues on Windows.
-    # ------------------------------------------------------------------
-    argfile = output_dir / f".exif_args_{stem}.txt"
-    rows = 0
-    with argfile.open("w", encoding="utf-8") as f:
-        for i in range(written):
-            if i >= len(src_indices):
-                break
-            src_idx = src_indices[i]
-            gps = gps_map.get(src_idx)
-            jpg = output_dir / f"{start_number + i}.jpg"
-            if not jpg.exists():
-                continue
+    fl_num = int(round(focal_length * 100))
+    exif_ifd = {
+        piexif.ExifIFD.FocalLength: (fl_num, 100),
+        piexif.ExifIFD.FocalLengthIn35mmFilm: int(focal_length),
+        piexif.ExifIFD.FNumber: (280, 100),
+        piexif.ExifIFD.ColorSpace: 1,
+        piexif.ExifIFD.ExifVersion: b"0230",
+        piexif.ExifIFD.FlashpixVersion: b"0100",
+        piexif.ExifIFD.ComponentsConfiguration: b"\x01\x02\x03\x00",
+        piexif.ExifIFD.FileSource: b"\x03",
+        piexif.ExifIFD.SceneType: b"\x01",
+        piexif.ExifIFD.LensSpecification: (
+            (2240, 100), (2240, 100), (280, 100), (280, 100),
+        ),
+        piexif.ExifIFD.DigitalZoomRatio: (100, 100),
+        piexif.ExifIFD.Contrast: 0,
+        piexif.ExifIFD.Saturation: 0,
+        piexif.ExifIFD.Sharpness: 0,
+        piexif.ExifIFD.WhiteBalance: 0,
+        piexif.ExifIFD.SceneCaptureType: 0,
+        piexif.ExifIFD.GainControl: 0,
+        piexif.ExifIFD.Flash: 0,
+        piexif.ExifIFD.MeteringMode: 1,
+        piexif.ExifIFD.LightSource: 1,
+        piexif.ExifIFD.ExposureMode: 1,
+        piexif.ExifIFD.ExposureProgram: 1,
+    }
 
-            f.write(f"-FocalLength={focal_length}\n")
-            f.write(f"-FocalLengthIn35mmFormat={int(focal_length)}\n")
-            if gps is not None:
-                lat, lon, alt = gps
-                lat_ref = "N" if lat >= 0 else "S"
-                lon_ref = "E" if lon >= 0 else "W"
-                alt_ref = 0 if alt >= 0 else 1
-                f.write(f"-GPSLatitude={abs(lat)}\n")
-                f.write(f"-GPSLatitudeRef={lat_ref}\n")
-                f.write(f"-GPSLongitude={abs(lon)}\n")
-                f.write(f"-GPSLongitudeRef={lon_ref}\n")
-                f.write(f"-GPSAltitude={abs(alt)}\n")
-                f.write(f"-GPSAltitudeRef={alt_ref}\n")
-            f.write(f"{jpg}\n")
-            f.write("-execute\n")
-            rows += 1
+    gps_ok = 0
+    errors = 0
+    log(f"  Writing EXIF (camera + GPS + focal {focal_length}mm) "
+        f"to {written} frames via piexif...")
 
-    if rows > 0:
-        log(f"  Writing EXIF (GPS + focal {focal_length}mm) to {rows} files via exiftool...")
-        r = subprocess.run(
-            ["exiftool", "-@", str(argfile), "-overwrite_original"],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0:
-            log(f"  exiftool (GPS) rc={r.returncode}")
-            if r.stderr.strip():
-                log(f"  stderr: {r.stderr.strip()}")
-            if r.stdout.strip():
-                log(f"  stdout: {r.stdout.strip()}")
-        else:
-            log("  EXIF done.")
-    else:
-        log("  No frames to write EXIF to.")
-    try:
-        argfile.unlink()
-    except OSError:
-        pass
+    for i in range(written):
+        if i >= len(src_indices):
+            break
+        src_idx = src_indices[i]
+        jpg = output_dir / f"{start_number + i}.jpg"
+        if not jpg.exists():
+            continue
+
+        # -- Build per-frame GPS IFD --
+        gps = gps_map.get(src_idx)
+        gps_ifd = {}
+        if gps is not None:
+            lat, lon, alt = gps
+            gps_ifd = {
+                piexif.GPSIFD.GPSVersionID: (2, 3, 0, 0),
+                piexif.GPSIFD.GPSLatitudeRef: "N" if lat >= 0 else "S",
+                piexif.GPSIFD.GPSLatitude: _deg_to_dms_rational(lat),
+                piexif.GPSIFD.GPSLongitudeRef: "E" if lon >= 0 else "W",
+                piexif.GPSIFD.GPSLongitude: _deg_to_dms_rational(lon),
+                piexif.GPSIFD.GPSAltitudeRef: 0 if alt >= 0 else 1,
+                piexif.GPSIFD.GPSAltitude: (int(round(abs(alt) * 1000)), 1000),
+            }
+            gps_ok += 1
+
+        exif_dict = {
+            "0th": zeroth_ifd,
+            "Exif": exif_ifd,
+            "GPS": gps_ifd,
+        }
+        try:
+            exif_bytes = piexif.dump(exif_dict)
+            piexif.insert(exif_bytes, str(jpg))
+        except Exception as e:  # noqa: BLE001
+            errors += 1
+            if errors <= 3:
+                log(f"    WARNING: piexif failed on {jpg.name}: {e}")
+
+    log(f"  EXIF done. GPS written to {gps_ok}/{written} frames"
+        f"{f', {errors} errors' if errors else ''}.")
 
 
 # --- Top-level driver -------------------------------------------------------
@@ -1296,15 +1287,25 @@ class App(tk.Tk):
             messagebox.showerror("Invalid resolution", str(e))
             return
 
-        for tool in ("ffmpeg", "ffprobe", "exiftool"):
+        for tool in ("ffmpeg", "ffprobe"):
             if shutil.which(tool) is None:
                 messagebox.showerror(
                     "Missing tool",
                     f"Required tool not found in PATH: {tool}\n\n"
-                    "macOS/Linux: brew/apt install ffmpeg exiftool\n"
-                    "Windows: install from their websites and add to PATH.",
+                    "macOS/Linux: brew/apt install ffmpeg\n"
+                    "Windows: install from ffmpeg.org and add to PATH.",
                 )
                 return
+
+        piexif, piexif_err = _try_import_piexif()
+        if piexif is None:
+            messagebox.showerror(
+                "Missing dependency",
+                "piexif is required for writing EXIF metadata.\n\n"
+                "Install with:\n    pip install piexif\n\n"
+                f"(import error: {piexif_err})",
+            )
+            return
 
         is_adaptive = self.mode_var.get() == MODES[1]
         if is_adaptive:

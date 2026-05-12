@@ -25,8 +25,7 @@ bin_dir = spec_dir / "bin"
 is_windows = sys.platform.startswith("win")
 exe_suffix = ".exe" if is_windows else ""
 
-required_bins = [f"ffmpeg{exe_suffix}", f"ffprobe{exe_suffix}",
-                 f"exiftool{exe_suffix}"]
+required_bins = [f"ffmpeg{exe_suffix}", f"ffprobe{exe_suffix}"]
 
 binaries = []
 for name in required_bins:
@@ -34,11 +33,7 @@ for name in required_bins:
     if p.exists():
         binaries.append((str(p), "bin"))
 
-# Bundle exiftool's perl libs folder if present (Windows portable build).
-et_files = bin_dir / "exiftool_files"
 datas = []
-if et_files.is_dir():
-    datas.append((str(et_files), "bin/exiftool_files"))
 
 # VSVersionInfo for Windows -- file generated alongside this spec.
 version_file = spec_dir / "windows_version.txt"
@@ -50,7 +45,7 @@ a = Analysis(
     pathex=[str(project_dir)],
     binaries=binaries,
     datas=datas,
-    hiddenimports=["cv2", "numpy"],
+    hiddenimports=["cv2", "numpy", "piexif"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
