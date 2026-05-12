@@ -41,7 +41,7 @@ if not getattr(sys, "frozen", False):
     if parent not in sys.path:
         sys.path.insert(0, parent)
 
-from extract_frames_with_gps_hwaccel import main  # noqa: E402
+from extract_frames_with_gps_similarity import main  # noqa: E402
 
 
 if __name__ == "__main__":

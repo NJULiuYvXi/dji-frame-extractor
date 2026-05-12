@@ -435,7 +435,7 @@ def extract_video_fixed(
     video: Path, srt_path, gps_map, max_src,
     output_dir: Path, start_number: int,
     interval: int, resolution, jpeg_quality: int,
-    hwaccel,
+    hwaccel, focal_length: float,
     base_progress: int, total_progress: int,
     log, set_progress, cancel_event: threading.Event,
 ):
@@ -529,7 +529,7 @@ def extract_video_fixed(
     set_progress(base_progress + written, total_progress)
 
     _write_gps_exif(output_dir, start_number, written, selected_src, gps_map,
-                    video.stem, log)
+                    video.stem, log, focal_length=focal_length)
     return written
 
 
@@ -542,6 +542,7 @@ def extract_video_adaptive(
     detector_name: str, prefer_cv2_cuda: bool,
     feature_long_side: int,
     resolution, jpeg_quality: int,
+    focal_length: float,
     base_progress: int, total_progress: int,
     log, set_progress, cancel_event: threading.Event,
 ):
@@ -666,14 +667,15 @@ def extract_video_adaptive(
     set_progress(base_progress + nframes_cv, total_progress)
 
     _write_gps_exif(output_dir, start_number, written, src_indices_kept,
-                    gps_map, video.stem, log)
+                    gps_map, video.stem, log, focal_length=focal_length)
     return written
 
 
 # --- GPS EXIF (shared by both modes) ----------------------------------------
 
 def _write_gps_exif(output_dir: Path, start_number: int, written: int,
-                    src_indices, gps_map, stem: str, log):
+                    src_indices, gps_map, stem: str, log,
+                    focal_length: float = 24.0):
     if written <= 0:
         return
     csv_path = output_dir / f".exif_batch_{stem}.csv"
@@ -685,26 +687,33 @@ def _write_gps_exif(output_dir: Path, start_number: int, written: int,
             "GPSLatitude", "GPSLatitudeRef",
             "GPSLongitude", "GPSLongitudeRef",
             "GPSAltitude", "GPSAltitudeRef",
+            "FocalLength", "FocalLengthIn35mmFormat",
         ])
         for i in range(written):
             if i >= len(src_indices):
                 break
             src_idx = src_indices[i]
             gps = gps_map.get(src_idx)
-            if gps is None:
-                continue
-            lat, lon, alt = gps
+            lat, lon, alt = gps if gps else (None, None, None)
             jpg = output_dir / f"{start_number + i}.jpg"
-            w.writerow([
-                str(jpg.resolve()),
-                abs(lat), "N" if lat >= 0 else "S",
-                abs(lon), "E" if lon >= 0 else "W",
-                abs(alt), 0 if alt >= 0 else 1,
-            ])
+            if gps is not None:
+                w.writerow([
+                    str(jpg.resolve()),
+                    abs(lat), "N" if lat >= 0 else "S",
+                    abs(lon), "E" if lon >= 0 else "W",
+                    abs(alt), 0 if alt >= 0 else 1,
+                    focal_length, int(focal_length),
+                ])
+            else:
+                w.writerow([
+                    str(jpg.resolve()),
+                    "", "", "", "", "", "",
+                    focal_length, int(focal_length),
+                ])
             rows += 1
 
     if rows > 0:
-        log(f"  Writing GPS EXIF to {rows} files via exiftool...")
+        log(f"  Writing EXIF (GPS + focal {focal_length}mm) to {rows} files via exiftool...")
         r = subprocess.run(
             ["exiftool", f"-csv={csv_path}", "-overwrite_original",
              "-q", "-q", str(output_dir)],
@@ -715,7 +724,7 @@ def _write_gps_exif(output_dir: Path, start_number: int, written: int,
         else:
             log("  EXIF done.")
     else:
-        log("  No GPS data available; JPEGs written without EXIF.")
+        log("  No frames to write EXIF to.")
     try:
         csv_path.unlink()
     except OSError:
@@ -737,6 +746,7 @@ def process_all(
     detector_name: str,       # "ORB" or "SIFT"
     prefer_cv2_cuda: bool,
     feature_long_side: int,
+    focal_length: float,
     log,
     set_progress,
     cancel_event: threading.Event,
@@ -801,7 +811,7 @@ def process_all(
             written = extract_video_fixed(
                 video, srt_path, gps_map, max_src,
                 output_dir, counter, interval, resolution, jpeg_quality,
-                hwaccel,
+                hwaccel, focal_length,
                 base, total_units,
                 log, set_progress, cancel_event,
             )
@@ -812,7 +822,7 @@ def process_all(
                 output_dir, counter,
                 target_overlap, tolerance,
                 detector_name, prefer_cv2_cuda, feature_long_side,
-                resolution, jpeg_quality,
+                resolution, jpeg_quality, focal_length,
                 base, total_units,
                 log, set_progress, cancel_event,
             )
@@ -851,13 +861,14 @@ class App(tk.Tk):
 
         # Adaptive mode
         self.detector_var = tk.StringVar(value=DETECTORS[0])
-        self.target_overlap_var = tk.IntVar(value=30)   # %
+        self.target_overlap_var = tk.IntVar(value=70)   # %
         self.tolerance_var = tk.IntVar(value=5)         # %
         self.feature_side_var = tk.IntVar(value=720)    # px
         self.use_cv2_cuda_var = tk.BooleanVar(value=False)
         self.cv2_cuda_status_var = tk.StringVar(value="(not probed)")
 
         # Common
+        self.focal_length_var = tk.DoubleVar(value=24.0)
         self.quality_var = tk.IntVar(value=2)
         self.res_preset_var = tk.StringVar(value="Original")
         self.custom_res_var = tk.StringVar(value="1920x1080")
@@ -1009,10 +1020,20 @@ class App(tk.Tk):
         ttk.Spinbox(opts, from_=1, to=31, textvariable=self.quality_var,
                     width=6).grid(row=1, column=1, sticky="w")
 
-        ttk.Label(opts, text="GPU decode (Fixed mode only):").grid(
+        ttk.Label(opts, text="Focal length (mm):").grid(
             row=2, column=0, sticky="w", padx=4, pady=4)
+        focal_row = ttk.Frame(opts)
+        focal_row.grid(row=2, column=1, sticky="w")
+        ttk.Spinbox(focal_row, from_=1, to=1200, increment=1,
+                    textvariable=self.focal_length_var, width=6).pack(side="left")
+        ttk.Label(focal_row,
+                  text="(written to EXIF FocalLength + FocalLengthIn35mmFormat)",
+                  foreground="#555").pack(side="left", padx=(8, 0))
+
+        ttk.Label(opts, text="GPU decode (Fixed mode only):").grid(
+            row=3, column=0, sticky="w", padx=4, pady=4)
         gpu_row = ttk.Frame(opts)
-        gpu_row.grid(row=2, column=1, sticky="w")
+        gpu_row.grid(row=3, column=1, sticky="w")
         ttk.Checkbutton(gpu_row, text="Use GPU (auto-detect)",
                         variable=self.use_gpu_var,
                         command=self._update_gpu_status_label).pack(side="left")
@@ -1232,12 +1253,14 @@ class App(tk.Tk):
         self.progress_label_var.set("Starting...")
 
         quality = max(1, min(31, self.quality_var.get()))
+        focal_length = max(1.0, self.focal_length_var.get())
 
         self.worker = threading.Thread(
             target=self._run, daemon=True,
             args=(
                 in_path, out_path, mode, interval, resolution, quality,
                 hwaccel, target, tol, detector, prefer_cuda, feature_side,
+                focal_length,
             ),
         )
         self.worker.start()
@@ -1247,11 +1270,13 @@ class App(tk.Tk):
         self._log(">> Cancel requested.")
 
     def _run(self, in_dir, out_dir, mode, interval, resolution, quality,
-             hwaccel, target, tol, detector, prefer_cuda, feature_side):
+             hwaccel, target, tol, detector, prefer_cuda, feature_side,
+             focal_length):
         try:
             process_all(
                 in_dir, out_dir, mode, interval, resolution, quality,
                 hwaccel, target, tol, detector, prefer_cuda, feature_side,
+                focal_length,
                 self._log, self._set_progress, self.cancel_event,
             )
         except Exception as e:  # noqa: BLE001
@@ -1273,9 +1298,14 @@ def main():
         use_gpu = "--gpu" in args
         prefer_cuda = "--cv2-cuda" in args
         feat_side = 720
+        focal_length = 24.0
         if "--feat-side" in args:
             i = args.index("--feat-side")
             feat_side = int(args[i + 1])
+            del args[i:i + 2]
+        if "--focal" in args:
+            i = args.index("--focal")
+            focal_length = float(args[i + 1])
             del args[i:i + 2]
         args = [a for a in args
                 if a not in ("--gpu", "--cv2-cuda")]
@@ -1283,9 +1313,10 @@ def main():
         if not args:
             print("Usage:\n"
                   "  --cli fixed    INPUT OUTPUT [INTERVAL] [WxH|-] [JPEG_Q] "
-                  "[--gpu]\n"
+                  "[--gpu] [--focal MM]\n"
                   "  --cli adaptive INPUT OUTPUT [TARGET%] [TOL%] "
-                  "[ORB|SIFT] [WxH|-] [JPEG_Q] [--cv2-cuda] [--feat-side N]")
+                  "[ORB|SIFT] [WxH|-] [JPEG_Q] [--cv2-cuda] [--feat-side N] "
+                  "[--focal MM]")
             sys.exit(2)
 
         sub = args[0].lower()
@@ -1313,7 +1344,7 @@ def main():
             try:
                 process_all(
                     in_dir, out_dir, "fixed", interval, resolution, quality,
-                    hwaccel, 0.0, 0.0, "ORB", False, 720,
+                    hwaccel, 0.0, 0.0, "ORB", False, 720, focal_length,
                     lambda m: print(m, flush=True), cli_progress, cancel,
                 )
             finally:
@@ -1325,7 +1356,7 @@ def main():
                 print("Need INPUT OUTPUT for adaptive mode.")
                 sys.exit(2)
             in_dir = Path(rest[0]); out_dir = Path(rest[1])
-            target_pct = float(rest[2]) if len(rest) > 2 else 30.0
+            target_pct = float(rest[2]) if len(rest) > 2 else 70.0
             tol_pct = float(rest[3]) if len(rest) > 3 else 5.0
             detector = (rest[4].upper() if len(rest) > 4 else "ORB")
             res_arg = rest[5] if len(rest) > 5 else "-"
@@ -1336,7 +1367,7 @@ def main():
                 process_all(
                     in_dir, out_dir, "adaptive", 1, resolution, quality,
                     None, target_pct / 100.0, tol_pct / 100.0,
-                    detector, prefer_cuda, feat_side,
+                    detector, prefer_cuda, feat_side, focal_length,
                     lambda m: print(m, flush=True), cli_progress, cancel,
                 )
             finally:
