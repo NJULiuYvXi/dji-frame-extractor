@@ -558,7 +558,29 @@ def extract_video_adaptive(
         f"({len(gps_map)} GPS entries)")
 
     cap = cv2.VideoCapture(str(video))
+    _tmp_link: Path | None = None
+    if not cap.isOpened() and platform.system() == "Windows":
+        # cv2.VideoCapture can't handle non-ASCII paths on Windows;
+        # create a temp hardlink with an ASCII-safe name.
+        import tempfile
+        tmp_dir = Path(tempfile.gettempdir())
+        _tmp_link = tmp_dir / f"_dji_extract_{os.getpid()}{video.suffix}"
+        try:
+            _tmp_link.unlink(missing_ok=True)
+            os.link(str(video), str(_tmp_link))
+        except OSError:
+            try:
+                shutil.copy2(str(video), str(_tmp_link))
+            except OSError:
+                _tmp_link = None
+        if _tmp_link and _tmp_link.exists():
+            cap = cv2.VideoCapture(str(_tmp_link))
     if not cap.isOpened():
+        if _tmp_link:
+            try:
+                _tmp_link.unlink(missing_ok=True)
+            except OSError:
+                pass
         log("  Could not open video with cv2.VideoCapture; skipping.")
         return 0
 
@@ -598,9 +620,14 @@ def extract_video_adaptive(
                 interpolation=cv2.INTER_LANCZOS4,
             )
         out_path = output_dir / f"{dst_idx}.jpg"
-        cv2.imwrite(
-            str(out_path), out_frame, [cv2.IMWRITE_JPEG_QUALITY, cv2_q]
-        )
+        # cv2.imwrite silently fails on Windows with non-ASCII paths;
+        # imencode + write_bytes works regardless of path encoding.
+        ok, buf = cv2.imencode(".jpg", out_frame,
+                               [cv2.IMWRITE_JPEG_QUALITY, cv2_q])
+        if ok:
+            out_path.write_bytes(buf.tobytes())
+        else:
+            log(f"    WARNING: failed to encode {out_path.name}")
 
     while True:
         if cancel_event.is_set():
@@ -656,6 +683,11 @@ def extract_video_adaptive(
                 f"kept {written}, last overlap={last_overlap*100:.1f}%")
 
     cap.release()
+    if _tmp_link:
+        try:
+            _tmp_link.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     if cancel_event.is_set():
         log("  Cancelled.")
