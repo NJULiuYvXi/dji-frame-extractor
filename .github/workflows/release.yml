@@ -91,13 +91,13 @@ jobs:
           set -euxo pipefail
           mkdir -p cross_build/bin
 
-          # Use a static ffmpeg build (johnvansickle.com) so the binary
-          # works on any glibc without depending on apt's libavcodec.
-          curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+          # Static ffmpeg from GitHub mirror (BtbN builds, reliable CDN).
+          curl -fsSL --retry 3 --retry-delay 5 \
+              https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz \
               -o /tmp/ffmpeg.tar.xz
           mkdir -p /tmp/ffx && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffx --strip-components=1
-          cp /tmp/ffx/ffmpeg  cross_build/bin/ffmpeg
-          cp /tmp/ffx/ffprobe cross_build/bin/ffprobe
+          cp /tmp/ffx/bin/ffmpeg  cross_build/bin/ffmpeg
+          cp /tmp/ffx/bin/ffprobe cross_build/bin/ffprobe
 
           chmod +x cross_build/bin/* || true
           ls -l cross_build/bin/
