@@ -104,6 +104,22 @@ def find_srt(video_path: Path):
     return None
 
 
+def find_reference_jpg(search_dir: Path):
+    """Find a JPG in *search_dir* to use as EXIF metadata donor.
+
+    Looks for .jpg / .JPG / .jpeg files (excluding numeric names that are
+    likely our own output). Returns the first match or None.
+    """
+    for ext in ("*.jpg", "*.JPG", "*.jpeg", "*.JPEG"):
+        for p in sorted(search_dir.glob(ext)):
+            # Skip files whose stem is purely numeric (our output frames).
+            if p.stem.isdigit():
+                continue
+            if p.stat().st_size > 0:
+                return p
+    return None
+
+
 def probe_frame_count(video_path: Path) -> int:
     try:
         r = subprocess.run(
@@ -436,6 +452,7 @@ def extract_video_fixed(
     output_dir: Path, start_number: int,
     interval: int, resolution, jpeg_quality: int,
     hwaccel, focal_length: float,
+    input_dir: Path,
     base_progress: int, total_progress: int,
     log, set_progress, cancel_event: threading.Event,
 ):
@@ -529,7 +546,8 @@ def extract_video_fixed(
     set_progress(base_progress + written, total_progress)
 
     _write_gps_exif(output_dir, start_number, written, selected_src, gps_map,
-                    video.stem, log, focal_length=focal_length)
+                    video.stem, log, focal_length=focal_length,
+                    input_dir=input_dir)
     return written
 
 
@@ -543,6 +561,7 @@ def extract_video_adaptive(
     feature_long_side: int,
     resolution, jpeg_quality: int,
     focal_length: float,
+    input_dir: Path,
     base_progress: int, total_progress: int,
     log, set_progress, cancel_event: threading.Event,
 ):
@@ -699,7 +718,8 @@ def extract_video_adaptive(
     set_progress(base_progress + nframes_cv, total_progress)
 
     _write_gps_exif(output_dir, start_number, written, src_indices_kept,
-                    gps_map, video.stem, log, focal_length=focal_length)
+                    gps_map, video.stem, log, focal_length=focal_length,
+                    input_dir=input_dir)
     return written
 
 
@@ -707,9 +727,57 @@ def extract_video_adaptive(
 
 def _write_gps_exif(output_dir: Path, start_number: int, written: int,
                     src_indices, gps_map, stem: str, log,
-                    focal_length: float = 24.0):
+                    focal_length: float = 24.0,
+                    input_dir: Path | None = None):
     if written <= 0:
         return
+
+    # ------------------------------------------------------------------
+    # Step 1: copy ALL metadata from a reference JPG (camera make/model,
+    # lens info, sensor size, colour space, etc.) so that photogrammetry
+    # software (DJI Terra, Metashape, COLMAP, ...) can recognise the
+    # camera.  GPS + focal length will be overwritten in step 2.
+    # ------------------------------------------------------------------
+    ref_jpg = None
+    if input_dir is not None:
+        ref_jpg = find_reference_jpg(input_dir)
+    if ref_jpg is None and input_dir is not None:
+        # Also look in the output dir (user might place the ref there).
+        ref_jpg = find_reference_jpg(output_dir)
+
+    if ref_jpg is not None:
+        log(f"  Reference JPG for EXIF metadata: {ref_jpg.name}")
+        # Copy everything EXCEPT GPS, focal length and image geometry
+        # (dimensions / orientation are set by the actual frame content).
+        r_ref = subprocess.run(
+            [
+                "exiftool",
+                f"-TagsFromFile", str(ref_jpg),
+                "--GPS:all",           # exclude -- we write per-frame GPS below
+                "--FocalLength",       # exclude
+                "--FocalLengthIn35mmFormat",
+                "--ImageWidth", "--ImageHeight",
+                "--ExifImageWidth", "--ExifImageHeight",
+                "--Orientation",
+                "--ThumbnailImage",    # don't copy a mismatched thumbnail
+                "-overwrite_original", "-q", "-q",
+                str(output_dir),
+            ],
+            capture_output=True, text=True,
+        )
+        if r_ref.returncode != 0 and r_ref.stderr.strip():
+            log(f"  exiftool (ref copy) stderr: {r_ref.stderr.strip()}")
+        else:
+            log("  Reference metadata copied to all frames.")
+    else:
+        log("  No reference JPG found in input dir; "
+            "only GPS + focal length will be written.")
+        log("  Tip: place a DJI photo (.jpg) in the input folder to "
+            "transfer full camera metadata (Make, Model, Lens, etc.).")
+
+    # ------------------------------------------------------------------
+    # Step 2: write per-frame GPS + focal length via CSV batch.
+    # ------------------------------------------------------------------
     csv_path = output_dir / f".exif_batch_{stem}.csv"
     rows = 0
     with csv_path.open("w", newline="", encoding="utf-8") as f:
@@ -805,6 +873,13 @@ def process_all(
             f"(+/-{tolerance*100:.0f}%), "
             f"prefer cv2.cuda={prefer_cv2_cuda}")
 
+    ref_jpg = find_reference_jpg(input_dir)
+    if ref_jpg:
+        log(f"Reference JPG for camera metadata: {ref_jpg.name}")
+    else:
+        log("No reference JPG found in input dir. Place a DJI photo "
+            "(.jpg) alongside the MP4s to copy full camera EXIF.")
+
     log(f"Found {len(videos)} video(s). Planning...")
 
     plans = []
@@ -843,7 +918,7 @@ def process_all(
             written = extract_video_fixed(
                 video, srt_path, gps_map, max_src,
                 output_dir, counter, interval, resolution, jpeg_quality,
-                hwaccel, focal_length,
+                hwaccel, focal_length, input_dir,
                 base, total_units,
                 log, set_progress, cancel_event,
             )
@@ -854,7 +929,7 @@ def process_all(
                 output_dir, counter,
                 target_overlap, tolerance,
                 detector_name, prefer_cv2_cuda, feature_long_side,
-                resolution, jpeg_quality, focal_length,
+                resolution, jpeg_quality, focal_length, input_dir,
                 base, total_units,
                 log, set_progress, cancel_event,
             )
