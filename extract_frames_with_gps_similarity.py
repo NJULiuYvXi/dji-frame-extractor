@@ -53,6 +53,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
@@ -446,6 +447,7 @@ def extract_video_fixed(
     output_dir: Path, start_number: int,
     interval: int, resolution, jpeg_quality: int,
     hwaccel, focal_length: float,
+    name_prefix: str,
     base_progress: int, total_progress: int,
     log, set_progress, cancel_event: threading.Event,
 ):
@@ -477,7 +479,7 @@ def extract_video_fixed(
         "-q:v", str(jpeg_quality),
         "-start_number", str(start_number),
         "-progress", "pipe:1", "-nostats",
-        str(output_dir / "%d.jpg"),
+        str(output_dir / f"{name_prefix}_%d.jpg"),
     ]
 
     res_label = f"{resolution[0]}x{resolution[1]}" if resolution else "original"
@@ -530,7 +532,7 @@ def extract_video_fixed(
 
     written = 0
     for i in range(len(selected_src)):
-        if (output_dir / f"{start_number + i}.jpg").exists():
+        if (output_dir / f"{name_prefix}_{start_number + i}.jpg").exists():
             written = i + 1
         else:
             break
@@ -539,7 +541,8 @@ def extract_video_fixed(
     set_progress(base_progress + written, total_progress)
 
     _write_gps_exif(output_dir, start_number, written, selected_src, gps_map,
-                    video.stem, log, focal_length=focal_length)
+                    video.stem, log, focal_length=focal_length,
+                    name_prefix=name_prefix)
     return written
 
 
@@ -553,6 +556,7 @@ def extract_video_adaptive(
     feature_long_side: int,
     resolution, jpeg_quality: int,
     focal_length: float,
+    name_prefix: str,
     base_progress: int, total_progress: int,
     log, set_progress, cancel_event: threading.Event,
 ):
@@ -629,7 +633,7 @@ def extract_video_adaptive(
                 frame, (resolution[0], resolution[1]),
                 interpolation=cv2.INTER_LANCZOS4,
             )
-        out_path = output_dir / f"{dst_idx}.jpg"
+        out_path = output_dir / f"{name_prefix}_{dst_idx}.jpg"
         # cv2.imwrite silently fails on Windows with non-ASCII paths;
         # imencode + write_bytes works regardless of path encoding.
         ok, buf = cv2.imencode(".jpg", out_frame,
@@ -655,7 +659,7 @@ def extract_video_adaptive(
             written += 1
             last_kept_src = src_idx
             last_features = estimator.features(frame)
-            log(f"    KEEP src #{src_idx} -> {dst_idx}.jpg "
+            log(f"    KEEP src #{src_idx} -> {name_prefix}_{dst_idx}.jpg "
                 f"(overlap=N/A, first frame)")
         else:
             fcur = estimator.features(frame)
@@ -682,7 +686,7 @@ def extract_video_adaptive(
                 gap = src_idx - last_kept_src
                 last_kept_src = src_idx
                 last_features = fcur
-                log(f"    KEEP src #{src_idx} -> {dst_idx}.jpg "
+                log(f"    KEEP src #{src_idx} -> {name_prefix}_{dst_idx}.jpg "
                     f"(overlap={ov*100:.1f}%, gap={gap} frames, {reason})")
 
         # Progress: based on source-frame index walked, not output frames.
@@ -709,7 +713,8 @@ def extract_video_adaptive(
     set_progress(base_progress + nframes_cv, total_progress)
 
     _write_gps_exif(output_dir, start_number, written, src_indices_kept,
-                    gps_map, video.stem, log, focal_length=focal_length)
+                    gps_map, video.stem, log, focal_length=focal_length,
+                    name_prefix=name_prefix)
     return written
 
 
@@ -727,7 +732,8 @@ def _deg_to_dms_rational(deg_float):
 
 def _write_gps_exif(output_dir: Path, start_number: int, written: int,
                     src_indices, gps_map, stem: str, log,
-                    focal_length: float = 24.0):
+                    focal_length: float = 24.0,
+                    name_prefix: str = "frame"):
     """Write camera metadata + per-frame GPS + focal length using piexif.
 
     Pure Python -- no exiftool dependency, no path-encoding issues on
@@ -791,7 +797,7 @@ def _write_gps_exif(output_dir: Path, start_number: int, written: int,
         if i >= len(src_indices):
             break
         src_idx = src_indices[i]
-        jpg = output_dir / f"{start_number + i}.jpg"
+        jpg = output_dir / f"{name_prefix}_{start_number + i}.jpg"
         if not jpg.exists():
             continue
 
@@ -844,6 +850,7 @@ def process_all(
     prefer_cv2_cuda: bool,
     feature_long_side: int,
     focal_length: float,
+    thread_count: int,
     log,
     set_progress,
     cancel_event: threading.Event,
@@ -857,6 +864,10 @@ def process_all(
     if not videos:
         log(f"No MP4 files found in {input_dir}")
         return
+
+    # Derive output filename prefix from the input folder name.
+    name_prefix = input_dir.name or "frame"
+    log(f"Output filename prefix: {name_prefix}_<n>.jpg")
 
     log(f"Mode: {mode}")
     if mode == "fixed":
@@ -896,37 +907,149 @@ def process_all(
     set_progress(0, total_units)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    counter = 1
-    base = 0
-    total_written = 0
-    for i, (video, srt_path, gps_map, max_src) in enumerate(plans):
+    effective_threads = max(1, min(int(thread_count), len(plans)))
+    log(f"Worker threads: {effective_threads}")
+    log("")
+
+    if effective_threads == 1:
+        # ---- Sequential path (zero behaviour change apart from prefix) -----
+        counter = 1
+        base = 0
+        total_written = 0
+        for i, (video, srt_path, gps_map, max_src) in enumerate(plans):
+            if cancel_event.is_set():
+                log("Cancelled.")
+                break
+            log(f"[{i + 1}/{len(plans)}] {video.name}")
+            if mode == "fixed":
+                written = extract_video_fixed(
+                    video, srt_path, gps_map, max_src,
+                    output_dir, counter, interval, resolution, jpeg_quality,
+                    hwaccel, focal_length, name_prefix,
+                    base, total_units,
+                    log, set_progress, cancel_event,
+                )
+                base += (max_src + interval - 1) // interval if max_src > 0 else 0
+            else:
+                written = extract_video_adaptive(
+                    video, srt_path, gps_map, max_src,
+                    output_dir, counter,
+                    target_overlap, tolerance,
+                    detector_name, prefer_cv2_cuda, feature_long_side,
+                    resolution, jpeg_quality, focal_length, name_prefix,
+                    base, total_units,
+                    log, set_progress, cancel_event,
+                )
+                base += max_src
+            counter += written
+            total_written += written
+            set_progress(base, total_units)
+
+        log("")
+        log(f"=== Done. Extracted {total_written} frames into {output_dir} ===")
+        return
+
+    # ---- Parallel path: per-video temp subdirs + post-renumber -----------
+    tmp_dirs: list[Path] = []
+    for i in range(len(plans)):
+        td = output_dir / f"_tmp_v{i}"
+        # Clean any stale temp dir from a previous run.
+        if td.exists():
+            shutil.rmtree(td, ignore_errors=True)
+        td.mkdir(parents=True, exist_ok=True)
+        tmp_dirs.append(td)
+
+    # Shared progress accumulator -- each thread reports deltas.
+    progress_lock = threading.Lock()
+    shared_progress = [0]
+
+    def make_thread_progress():
+        last = [0]
+        def _progress(current: int, _total: int):
+            delta = current - last[0]
+            last[0] = current
+            if delta == 0:
+                return
+            with progress_lock:
+                shared_progress[0] += delta
+                cur = shared_progress[0]
+            set_progress(cur, total_units)
+        return _progress
+
+    def _extract_one(idx: int, video: Path, srt_path, gps_map, max_src,
+                     tmp_dir: Path):
         if cancel_event.is_set():
-            log("Cancelled.")
-            break
-        log(f"[{i + 1}/{len(plans)}] {video.name}")
-        if mode == "fixed":
-            written = extract_video_fixed(
-                video, srt_path, gps_map, max_src,
-                output_dir, counter, interval, resolution, jpeg_quality,
-                hwaccel, focal_length,
-                base, total_units,
-                log, set_progress, cancel_event,
-            )
-            base += (max_src + interval - 1) // interval if max_src > 0 else 0
-        else:
-            written = extract_video_adaptive(
-                video, srt_path, gps_map, max_src,
-                output_dir, counter,
-                target_overlap, tolerance,
-                detector_name, prefer_cv2_cuda, feature_long_side,
-                resolution, jpeg_quality, focal_length,
-                base, total_units,
-                log, set_progress, cancel_event,
-            )
-            base += max_src
-        counter += written
-        total_written += written
-        set_progress(base, total_units)
+            return idx, 0
+        log(f"[thread] start [{idx + 1}/{len(plans)}] {video.name}")
+        thread_progress = make_thread_progress()
+        try:
+            if mode == "fixed":
+                w = extract_video_fixed(
+                    video, srt_path, gps_map, max_src,
+                    tmp_dir, 1, interval, resolution, jpeg_quality,
+                    hwaccel, focal_length, name_prefix,
+                    0, total_units,
+                    log, thread_progress, cancel_event,
+                )
+            else:
+                w = extract_video_adaptive(
+                    video, srt_path, gps_map, max_src,
+                    tmp_dir, 1,
+                    target_overlap, tolerance,
+                    detector_name, prefer_cv2_cuda, feature_long_side,
+                    resolution, jpeg_quality, focal_length, name_prefix,
+                    0, total_units,
+                    log, thread_progress, cancel_event,
+                )
+        except Exception as e:  # noqa: BLE001
+            log(f"[thread] ERROR on {video.name}: {e}")
+            return idx, 0
+        log(f"[thread] done  [{idx + 1}/{len(plans)}] {video.name}: {w} frames")
+        return idx, w
+
+    results: list[tuple[int, int]] = []
+    with ThreadPoolExecutor(max_workers=effective_threads) as pool:
+        futures = [
+            pool.submit(_extract_one, i, v, s, g, m, tmp_dirs[i])
+            for i, (v, s, g, m) in enumerate(plans)
+        ]
+        for f in as_completed(futures):
+            try:
+                results.append(f.result())
+            except Exception as e:  # noqa: BLE001
+                log(f"[thread] future exception: {e}")
+
+    if cancel_event.is_set():
+        log("Cancelled. Cleaning up temp dirs...")
+        for td in tmp_dirs:
+            shutil.rmtree(td, ignore_errors=True)
+        return
+
+    # ---- Phase 3: merge + renumber, in video order ---------------------
+    log("")
+    log("Merging extracted frames into final sequential numbering...")
+    results.sort(key=lambda r: r[0])
+    counter = 1
+    total_written = 0
+    for idx, written in results:
+        td = tmp_dirs[idx]
+        for j in range(1, written + 1):
+            if cancel_event.is_set():
+                break
+            src = td / f"{name_prefix}_{j}.jpg"
+            dst = output_dir / f"{name_prefix}_{counter}.jpg"
+            if not src.exists():
+                continue
+            try:
+                if dst.exists():
+                    dst.unlink()
+                src.rename(dst)
+            except OSError as e:
+                log(f"  rename failed {src.name} -> {dst.name}: {e}")
+                continue
+            counter += 1
+            total_written += 1
+        shutil.rmtree(td, ignore_errors=True)
 
     log("")
     log(f"=== Done. Extracted {total_written} frames into {output_dir} ===")
@@ -971,6 +1094,7 @@ class App(tk.Tk):
         self.custom_res_var = tk.StringVar(value="1920x1080")
         self.use_gpu_var = tk.BooleanVar(value=False)
         self.gpu_status_var = tk.StringVar(value="(not probed)")
+        self.thread_count_var = tk.IntVar(value=min(4, os.cpu_count() or 4))
         self.progress_label_var = tk.StringVar(value="Idle.")
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
@@ -1138,6 +1262,16 @@ class App(tk.Tk):
                   foreground="#555").pack(side="left", padx=(8, 0))
         ttk.Button(gpu_row, text="Re-detect",
                    command=self._redetect_gpu).pack(side="left", padx=(8, 0))
+
+        ttk.Label(opts, text="Worker threads:").grid(
+            row=4, column=0, sticky="w", padx=4, pady=4)
+        thread_row = ttk.Frame(opts)
+        thread_row.grid(row=4, column=1, sticky="w")
+        ttk.Spinbox(thread_row, from_=1, to=16, increment=1,
+                    textvariable=self.thread_count_var, width=6).pack(side="left")
+        ttk.Label(thread_row,
+                  text="(parallel video processing; 1 = sequential)",
+                  foreground="#555").pack(side="left", padx=(8, 0))
 
         # ---- Run controls ----
         btns = ttk.Frame(self)
@@ -1361,13 +1495,14 @@ class App(tk.Tk):
 
         quality = max(1, min(31, self.quality_var.get()))
         focal_length = max(1.0, self.focal_length_var.get())
+        thread_count = max(1, min(16, self.thread_count_var.get()))
 
         self.worker = threading.Thread(
             target=self._run, daemon=True,
             args=(
                 in_path, out_path, mode, interval, resolution, quality,
                 hwaccel, target, tol, detector, prefer_cuda, feature_side,
-                focal_length,
+                focal_length, thread_count,
             ),
         )
         self.worker.start()
@@ -1378,12 +1513,12 @@ class App(tk.Tk):
 
     def _run(self, in_dir, out_dir, mode, interval, resolution, quality,
              hwaccel, target, tol, detector, prefer_cuda, feature_side,
-             focal_length):
+             focal_length, thread_count):
         try:
             process_all(
                 in_dir, out_dir, mode, interval, resolution, quality,
                 hwaccel, target, tol, detector, prefer_cuda, feature_side,
-                focal_length,
+                focal_length, thread_count,
                 self._log, self._set_progress, self.cancel_event,
             )
         except Exception as e:  # noqa: BLE001
@@ -1406,6 +1541,7 @@ def main():
         prefer_cuda = "--cv2-cuda" in args
         feat_side = 720
         focal_length = 24.0
+        thread_count = 1
         if "--feat-side" in args:
             i = args.index("--feat-side")
             feat_side = int(args[i + 1])
@@ -1414,16 +1550,20 @@ def main():
             i = args.index("--focal")
             focal_length = float(args[i + 1])
             del args[i:i + 2]
+        if "--threads" in args:
+            i = args.index("--threads")
+            thread_count = max(1, int(args[i + 1]))
+            del args[i:i + 2]
         args = [a for a in args
                 if a not in ("--gpu", "--cv2-cuda")]
 
         if not args:
             print("Usage:\n"
                   "  --cli fixed    INPUT OUTPUT [INTERVAL] [WxH|-] [JPEG_Q] "
-                  "[--gpu] [--focal MM]\n"
+                  "[--gpu] [--focal MM] [--threads N]\n"
                   "  --cli adaptive INPUT OUTPUT [TARGET%] [TOL%] "
                   "[ORB|SIFT] [WxH|-] [JPEG_Q] [--cv2-cuda] [--feat-side N] "
-                  "[--focal MM]")
+                  "[--focal MM] [--threads N]")
             sys.exit(2)
 
         sub = args[0].lower()
@@ -1452,6 +1592,7 @@ def main():
                 process_all(
                     in_dir, out_dir, "fixed", interval, resolution, quality,
                     hwaccel, 0.0, 0.0, "ORB", False, 720, focal_length,
+                    thread_count,
                     lambda m: print(m, flush=True), cli_progress, cancel,
                 )
             finally:
@@ -1475,6 +1616,7 @@ def main():
                     in_dir, out_dir, "adaptive", 1, resolution, quality,
                     None, target_pct / 100.0, tol_pct / 100.0,
                     detector, prefer_cuda, feat_side, focal_length,
+                    thread_count,
                     lambda m: print(m, flush=True), cli_progress, cancel,
                 )
             finally:
