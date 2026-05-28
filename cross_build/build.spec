@@ -16,6 +16,7 @@
 # before invoking pyinstaller.
 
 import sys
+import os
 from pathlib import Path
 
 spec_dir = Path(SPECPATH).resolve()
@@ -33,6 +34,25 @@ for name in required_bins:
     if p.exists():
         binaries.append((str(p), "bin"))
 
+if is_windows:
+    opencv_cuda_bin = os.environ.get("OPENCV_CUDA_BIN_DIR")
+    if opencv_cuda_bin:
+        for dll in sorted(Path(opencv_cuda_bin).glob("*.dll")):
+            binaries.append((str(dll), "."))
+
+    cuda_bin = Path(os.environ.get("CUDA_PATH", "")) / "bin"
+    cuda_patterns = [
+        "cudart64_*.dll",
+        "cublas64_*.dll",
+        "cublasLt64_*.dll",
+        "cufft64_*.dll",
+        "npp*64_*.dll",
+    ]
+    if cuda_bin.exists():
+        for pattern in cuda_patterns:
+            for dll in sorted(cuda_bin.glob(pattern)):
+                binaries.append((str(dll), "."))
+
 datas = []
 
 # VSVersionInfo for Windows -- file generated alongside this spec.
@@ -48,7 +68,7 @@ a = Analysis(
     hiddenimports=["cv2", "numpy", "piexif"],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["opencv_cuda_runtime_hook.py"] if is_windows else [],
     excludes=[],
     noarchive=False,
 )

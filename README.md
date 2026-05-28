@@ -90,6 +90,11 @@ Download from the latest [Release](../../releases/latest):
 * **Windows (x64)** — `extract-frames-windows-x64.zip`. Extract anywhere,
   then run `extract-frames.exe` inside. ffmpeg / ffprobe / exiftool are
   bundled.
+* **Windows CUDA (x64, NVIDIA sm_86 / CUDA 11.8)** —
+  `extract-frames-windows-x64-cuda11.8-sm86.zip`. This build bundles a
+  CUDA-enabled OpenCV 4.10.0 for `cv2.cuda_ORB` acceleration on RTX 30-series
+  GPUs. Verify it from PowerShell with:
+  `.\extract-frames.exe --probe-cv2-cuda`.
 * **macOS (Apple Silicon)** — `extract-frames-macos-arm64`. Run with
   `chmod +x extract-frames-macos-arm64 && ./extract-frames-macos-arm64`.
   Requires `brew install ffmpeg exiftool` on the host.
@@ -114,7 +119,11 @@ download entirely.
 If your IT policy blocks SmartScreen overrides:
 - Right-click the zip / exe → Properties → tick **Unblock** before running.
 - Or run from source (`pip install` flow below).
-- Or build the exe locally with `windows_build/build.bat`.
+- Or build the regular exe locally with `windows_build/build.bat`.
+- Or build the CUDA exe locally with
+  `powershell -ExecutionPolicy Bypass -File windows_build/build_opencv_cuda.ps1`
+  followed by
+  `powershell -ExecutionPolicy Bypass -File windows_build/build_cuda_release.ps1`.
 
 #### macOS Gatekeeper warning ("cannot be opened because the developer cannot be verified")
 

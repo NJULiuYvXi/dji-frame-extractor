@@ -226,17 +226,42 @@ def probe_hwaccel():
 
 # --- cv2 CUDA detection (used by adaptive mode for ORB) ---------------------
 
+def _opencv_build_has_cuda(cv2):
+    """Return True/False when OpenCV build info makes CUDA support explicit."""
+    try:
+        info = cv2.getBuildInformation()
+    except Exception:  # noqa: BLE001
+        return None
+
+    if re.search(r"^\s*NVIDIA CUDA:\s+YES\b", info, re.I | re.M):
+        return True
+    if re.search(r"^\s*NVIDIA CUDA:\s+NO\b", info, re.I | re.M):
+        return False
+    if re.search(r"^\s*Unavailable:\s+.*\bcuda", info, re.I | re.M):
+        return False
+    return None
+
+
 def probe_cv2_cuda():
     """Return (available, info_string)."""
     cv2, np, err = _try_import_cv2()
     if cv2 is None:
         return False, f"opencv-python not installed ({err})"
+    build_has_cuda = _opencv_build_has_cuda(cv2)
+    if build_has_cuda is False:
+        ver = getattr(cv2, "__version__", "unknown version")
+        return False, f"OpenCV {ver} was packaged without CUDA support"
     try:
         n = cv2.cuda.getCudaEnabledDeviceCount()
     except Exception:  # noqa: BLE001
-        return False, "this OpenCV build has no CUDA module"
+        if build_has_cuda is False:
+            ver = getattr(cv2, "__version__", "unknown version")
+            return False, f"OpenCV {ver} was packaged without CUDA support"
+        return False, "this OpenCV build has no CUDA runtime module"
     if n <= 0:
-        return False, "no CUDA-capable device usable by OpenCV"
+        if build_has_cuda is True:
+            return False, "OpenCV has CUDA support, but no CUDA device is visible"
+        return False, "OpenCV reports 0 CUDA devices; likely a CPU-only build"
     try:
         name = cv2.cuda.printCudaDeviceInfo  # presence check
         return True, f"cv2.cuda available ({n} device(s))"
@@ -1532,6 +1557,23 @@ class App(tk.Tk):
 
 
 def main():
+    if "--probe-cv2-cuda" in sys.argv:
+        ok, info = probe_cv2_cuda()
+        print(info)
+        cv2, np, err = _try_import_cv2()
+        if cv2 is not None:
+            print(f"OpenCV: {getattr(cv2, '__version__', 'unknown')}")
+            print(f"cv2 path: {getattr(cv2, '__file__', 'unknown')}")
+            try:
+                build_info = cv2.getBuildInformation()
+                for line in build_info.splitlines():
+                    if "NVIDIA CUDA:" in line:
+                        print(line.strip())
+                        break
+            except Exception:
+                pass
+        sys.exit(0 if ok else 1)
+
     # --cli  fixed       INPUT OUTPUT [INTERVAL] [WxH|-] [JPEG_Q] [--gpu]
     # --cli  adaptive    INPUT OUTPUT [TARGET%] [TOL%] [ORB|SIFT] [WxH|-]
     #                    [JPEG_Q] [--cv2-cuda] [--feat-side N]
