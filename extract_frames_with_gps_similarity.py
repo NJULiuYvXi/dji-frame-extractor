@@ -1082,6 +1082,103 @@ def process_all(
     log(f"=== Done. Extracted {total_written} frames into {output_dir} ===")
 
 
+# --- Batch driver (recurse into subfolders) ---------------------------------
+
+def process_all_batch(
+    parent_dir: Path,
+    output_root: Path,
+    mode: str,
+    interval: int,
+    resolution,
+    jpeg_quality: int,
+    hwaccel,
+    target_overlap: float,
+    tolerance: float,
+    detector_name: str,
+    prefer_cv2_cuda: bool,
+    feature_long_side: int,
+    focal_length: float,
+    thread_count: int,
+    log,
+    set_progress,
+    cancel_event: threading.Event,
+):
+    """Process every subfolder of parent_dir that directly contains MP4s.
+
+    Each job folder is sent through process_all() with its own output dir
+    at output_root/<folder name>/ and its own filename prefix (the folder
+    name). The parent itself is also processed if it holds videos directly.
+    Mirrors process_all()'s positional signature so callers can swap them.
+    """
+    def _has_mp4(d: Path) -> bool:
+        try:
+            return any(
+                p.is_file() and p.suffix.lower() == ".mp4"
+                and not p.name.startswith("._")
+                for p in d.iterdir()
+            )
+        except OSError:
+            return False
+
+    try:
+        out_root_resolved = output_root.resolve()
+    except OSError:
+        out_root_resolved = output_root
+
+    jobs: list[Path] = []
+    if _has_mp4(parent_dir):
+        jobs.append(parent_dir)
+    try:
+        subdirs = sorted(
+            [d for d in parent_dir.iterdir() if d.is_dir()],
+            key=lambda d: d.name,
+        )
+    except OSError:
+        subdirs = []
+    for sub in subdirs:
+        try:
+            if sub.resolve() == out_root_resolved:
+                continue  # never treat the output root as an input job
+        except OSError:
+            pass
+        if _has_mp4(sub):
+            jobs.append(sub)
+
+    if not jobs:
+        log(f"Batch: no folder containing MP4 files found under {parent_dir}")
+        return
+
+    log(f"Batch mode: {len(jobs)} folder(s) to process; "
+        f"each -> {output_root} / <folder name> /")
+    for j in jobs:
+        log(f"  - {j.name}")
+
+    done = 0
+    for i, job in enumerate(jobs):
+        if cancel_event.is_set():
+            log("Batch cancelled.")
+            break
+        out_dir = output_root / job.name
+        log("")
+        log("############################################################")
+        log(f"[batch {i + 1}/{len(jobs)}] {job.name}  ->  {out_dir}")
+        log("############################################################")
+        try:
+            process_all(
+                job, out_dir, mode, interval, resolution, jpeg_quality,
+                hwaccel, target_overlap, tolerance, detector_name,
+                prefer_cv2_cuda, feature_long_side, focal_length,
+                thread_count, log, set_progress, cancel_event,
+            )
+            done += 1
+        except Exception as e:  # noqa: BLE001
+            log(f"[batch] ERROR on {job.name}: {e}")
+
+    log("")
+    log(f"=== Batch done. Processed {done}/{len(jobs)} folder(s) "
+        f"into {output_root} ===")
+
+
 # --- GUI --------------------------------------------------------------------
 
 RES_PRESETS = [
@@ -1101,6 +1198,7 @@ class App(tk.Tk):
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
+        self.batch_var = tk.BooleanVar(value=False)
         self.mode_var = tk.StringVar(value=MODES[0])
 
         # Fixed mode
@@ -1155,6 +1253,12 @@ class App(tk.Tk):
             row=1, column=1, sticky="we", padx=4)
         ttk.Button(paths, text="Browse...", command=self._pick_out).grid(
             row=1, column=2)
+        ttk.Checkbutton(
+            paths,
+            text="Batch: process each subfolder that contains videos "
+                 "(output -> <Output folder>/<subfolder name>/)",
+            variable=self.batch_var,
+        ).grid(row=2, column=1, sticky="w", padx=4, pady=(2, 0))
 
         # ---- Mode selector ----
         mode_frame = ttk.LabelFrame(self, text="Extraction mode")
@@ -1439,6 +1543,7 @@ class App(tk.Tk):
             return
         in_path = Path(in_dir)
         out_path = Path(out_dir)
+        batch = bool(self.batch_var.get())
         if not in_path.is_dir():
             messagebox.showerror("Error", f"Input is not a directory:\n{in_dir}")
             return
@@ -1504,7 +1609,7 @@ class App(tk.Tk):
                 ):
                     return
 
-        if out_path.exists() and any(out_path.iterdir()):
+        if not batch and out_path.exists() and any(out_path.iterdir()):
             if not messagebox.askyesno(
                 "Output not empty",
                 f"Output folder is not empty:\n{out_path}\n\n"
@@ -1529,7 +1634,7 @@ class App(tk.Tk):
             args=(
                 in_path, out_path, mode, interval, resolution, quality,
                 hwaccel, target, tol, detector, prefer_cuda, feature_side,
-                focal_length, thread_count,
+                focal_length, thread_count, batch,
             ),
         )
         self.worker.start()
@@ -1540,9 +1645,10 @@ class App(tk.Tk):
 
     def _run(self, in_dir, out_dir, mode, interval, resolution, quality,
              hwaccel, target, tol, detector, prefer_cuda, feature_side,
-             focal_length, thread_count):
+             focal_length, thread_count, batch=False):
         try:
-            process_all(
+            runner = process_all_batch if batch else process_all
+            runner(
                 in_dir, out_dir, mode, interval, resolution, quality,
                 hwaccel, target, tol, detector, prefer_cuda, feature_side,
                 focal_length, thread_count,
@@ -1583,6 +1689,7 @@ def main():
         args = [a for a in sys.argv[1:] if a != "--cli"]
         use_gpu = "--gpu" in args
         prefer_cuda = "--cv2-cuda" in args
+        batch = "--batch" in args
         feat_side = 720
         focal_length = 24.0
         thread_count = 1
@@ -1599,15 +1706,17 @@ def main():
             thread_count = max(1, int(args[i + 1]))
             del args[i:i + 2]
         args = [a for a in args
-                if a not in ("--gpu", "--cv2-cuda")]
+                if a not in ("--gpu", "--cv2-cuda", "--batch")]
 
         if not args:
             print("Usage:\n"
                   "  --cli fixed    INPUT OUTPUT [INTERVAL] [WxH|-] [JPEG_Q] "
-                  "[--gpu] [--focal MM] [--threads N]\n"
+                  "[--gpu] [--focal MM] [--threads N] [--batch]\n"
                   "  --cli adaptive INPUT OUTPUT [TARGET%] [TOL%] "
                   "[ORB|SIFT] [WxH|-] [JPEG_Q] [--cv2-cuda] [--feat-side N] "
-                  "[--focal MM] [--threads N]")
+                  "[--focal MM] [--threads N] [--batch]\n"
+                  "  (--batch: INPUT is a parent dir; process each subfolder "
+                  "that holds videos, output to OUTPUT/<subfolder>/)")
             sys.exit(2)
 
         sub = args[0].lower()
@@ -1633,7 +1742,7 @@ def main():
                           else parse_resolution(res_arg))
             hwaccel = probe_hwaccel() if use_gpu else None
             try:
-                process_all(
+                (process_all_batch if batch else process_all)(
                     in_dir, out_dir, "fixed", interval, resolution, quality,
                     hwaccel, 0.0, 0.0, "ORB", False, 720, focal_length,
                     thread_count,
@@ -1656,7 +1765,7 @@ def main():
             resolution = (None if res_arg in ("-", "", "original")
                           else parse_resolution(res_arg))
             try:
-                process_all(
+                (process_all_batch if batch else process_all)(
                     in_dir, out_dir, "adaptive", 1, resolution, quality,
                     None, target_pct / 100.0, tol_pct / 100.0,
                     detector, prefer_cuda, feat_side, focal_length,
