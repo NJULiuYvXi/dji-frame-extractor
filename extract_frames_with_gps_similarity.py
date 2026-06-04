@@ -387,12 +387,14 @@ class OverlapEstimator:
         # --- match descriptors ---
         try:
             if self.use_cuda:
-                if fa["desc_g"] is None or fb["desc_g"] is None:
+                da, db = fa["desc_g"], fb["desc_g"]
+                if da is None or db is None or da.empty() or db.empty():
                     return 0.0
-                if (fa["desc_g"].size().width == 0
-                        or fb["desc_g"].size().width == 0):
+                # cuda_GpuMat.size() -> (width, height) tuple, where
+                # height == number of descriptor rows. Need >= 2 to knnMatch.
+                if da.size()[1] < 4 or db.size()[1] < 4:
                     return 0.0
-                matches = self._matcher_g.knnMatch(fb["desc_g"], fa["desc_g"], k=2)
+                matches = self._matcher_g.knnMatch(db, da, k=2)
             else:
                 if fa["desc"] is None or fb["desc"] is None:
                     return 0.0
